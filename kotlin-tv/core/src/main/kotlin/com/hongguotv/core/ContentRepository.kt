@@ -17,10 +17,12 @@ data class Series(val id: String, val title: String, val cover: String = "", val
     fun toJson() = JSONObject().put("id",id).put("title",title).put("cover",cover).put("description",description).put("badge",badge).put("tags",tags)
     companion object { fun fromJson(o: JSONObject) = Series(o.str("id"),o.str("title"),o.str("cover"),o.str("description"),o.str("badge"),o.str("tags")) }
 }
-data class Detail(val series: Series, val episodes: List<String>)
+data class Detail(val series: Series, val episodes: List<String>, val related: List<Series> = emptyList(), val sameName: List<Series> = emptyList())
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
+/** One website genre selector entry; the slug selects the category path, ids echo back for validation. */
+data class Genre(val slug: String, val name: String, val ids: List<String>)
 data class StreamInfo(val url: String, val key: ByteArray?, val quality: String)
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 
@@ -29,6 +31,8 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     private val site = "https://hongguoduanju.com"
     private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
     private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
+    private val genreCache=mutableMapOf<ContentType,Pair<Long,List<Genre>>>()
+    private fun categoryPath(type: ContentType)=if(type==ContentType.COMIC) "comic-drama" else "real-drama"
     private fun text(url: String, signed: Signer.Request? = null): String {
         val request = Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Accept-Language","zh-CN,zh;q=0.9")
         signed?.headers?.forEach { (k,v) -> request.header(k,v) }
@@ -52,16 +56,44 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return Series(o.str("series_id"),o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { item.str("name") } },cleanUrl(o.str("series_cover")),o.str("series_intro"),o.str("episode_right_text").ifEmpty { if(count>0) "全 ${count} 集" else "" },(0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optJSONObject(it)?.str("name") ?: tags.optString(it) })
     }
     private fun valid(rows: List<Series>) = rows.filter { it.id.matches(Regex("[0-9]{1,30}")) && it.title.isNotBlank() }.distinctBy { it.id }
-    fun comicRanking(page: Int = 1): CatalogPage {
+    fun ranking(board: RankBoard, page: Int = 1): CatalogPage {
         require(page in 1..100)
-        return ComicRank.parse(text("$site/rank/hot-comic-drama?page=$page"),page)
+        return ComicRank.parse(text("$site/rank/${board.path}?page=$page"),page,board)
     }
-    fun home(page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
+    fun comicRanking(page: Int = 1)=ranking(RankBoard.COMIC,page)
+    fun realRanking(page: Int = 1)=ranking(RankBoard.REAL,page)
+    /** Genre selectors from the website's category page; cached briefly because they rarely change. */
+    fun genres(type: ContentType): List<Genre> {
+        synchronized(genreCache) { genreCache[type]?.let { if(clock()-it.first<600_000) return it.second } }
+        val data=router("$site/category/${categoryPath(type)}")
+        val section=data.optJSONObject("category_page") ?: data.optJSONObject("category_$") ?: throw IOException("题材列表暂不可用")
+        val rows=section.optJSONArray("selectorList") ?: throw IOException("题材列表暂不可用")
+        val genres=linkedMapOf<String,Genre>()
+        for(row in rows.objects()) for(item in row.optJSONArray("items")?.objects() ?: emptyList()) {
+            val ids=item.optJSONArray("category_json_ids") ?: continue
+            val list=(0 until ids.length()).map { ids.optString(it) }.filter { it.isNotBlank() }
+            val slug=item.str("selector_item_id"); val name=item.str("show_name")
+            if(slug.isNotBlank() && name.isNotBlank() && list.isNotEmpty()) genres.putIfAbsent(slug,Genre(slug,name,list))
+        }
+        if(genres.isEmpty()) throw IOException("题材列表暂不可用")
+        return genres.values.toList().also { list -> synchronized(genreCache) { genreCache[type]=clock() to list } }
+    }
+    fun home(page: Int = 1, type: ContentType = ContentType.SHORT, genre: Genre? = null): CatalogPage {
         require(page in 1..100)
+        if(genre!=null) return categoryListing("$site/category/${categoryPath(type)}/${genre.slug}"+if(page>1) "?page=$page" else "",page,"题材",genre)
         if(type==ContentType.COMIC) return comicRanking(page)
-        val data=router("$site/category?tab=1&sort_type=1"+if(page>1) "&page=$page" else "")
-        val section=data.optJSONObject("category_page") ?: data.optJSONObject("category_$") ?: throw IOException("首页数据结构已变化")
-        val rows=section.optJSONArray("recommendList") ?: section.optJSONObject("categoryData")?.optJSONArray("recommendList") ?: throw IOException("首页数据暂不可用")
+        return categoryListing("$site/category?tab=1&sort_type=1"+if(page>1) "&page=$page" else "",page,"首页")
+    }
+    private fun categoryListing(url: String,page: Int,label: String,genre: Genre? = null): CatalogPage {
+        val data=router(url)
+        val section=data.optJSONObject("category_page") ?: data.optJSONObject("category_$") ?: throw IOException("${label}数据结构已变化")
+        if(genre!=null) {
+            // The site silently ignores filters it does not recognize; only the echoed ids prove the genre applied.
+            val applied=section.optJSONObject("apiQuery")?.optJSONArray("category_json_ids")
+            val matched=applied!=null && genre.ids.any { id -> (0 until applied.length()).any { applied.optString(it)==id } }
+            if(!matched) throw IOException("题材筛选暂不可用，请稍后重试")
+        }
+        val rows=section.optJSONArray("recommendList") ?: section.optJSONObject("categoryData")?.optJSONArray("recommendList") ?: throw IOException("${label}数据暂不可用")
         val items=valid(rows.objects().map(::card))
         val lastPage=section.optJSONObject("pagination")?.optInt("totalPages",100) ?: 100
         return CatalogPage(items,items.isNotEmpty() && page<minOf(lastPage,100))
@@ -74,7 +106,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             return webSearch(keyword,page,COMIC_WEB_GENRE)
         }
         try { val result=appSearch(keyword,page,type); if(result.items.isNotEmpty() || !result.hasMore) return result } catch (e: Exception) { if(e is SearchSessionExpiredException) throw e; /* Website fallback for short dramas only. */ }
-        return webSearch(keyword,page,null)
+        return webSearch(keyword,page,SHORT_WEB_GENRE)
     }
     private fun webSearch(keyword: String, page: Int, genre: String?): CatalogPage {
         val data=router("$site/search/${Signer.encode(keyword)}?page=$page")
@@ -85,6 +117,7 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return CatalogPage(items,items.isNotEmpty() && page<100)
     }
     private fun appSearch(keyword: String, page: Int, type: ContentType): CatalogPage {
+        VendorConstants.regenerate()
         val values=VendorConstants.device.toMutableMap()
         for(k in listOf("version_code","manifest_version_code","update_version_code","pv_player")) values[k]="72232"
         values["version_name"]="7.2.2.32"
@@ -125,14 +158,65 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     fun detail(id: String): Detail {
         require(id.matches(Regex("[0-9]{1,30}")))
-        val o=router("$site/detail?series_id=$id").optJSONObject("detail_page")?.optJSONObject("seriesDetail") ?: throw IOException("剧集详情暂不可用")
+        val html=text("$site/detail?series_id=$id")
+        val loader=extractRouter(html).getJSONObject("loaderData")
+        val o=loader.optJSONObject("detail_page")?.optJSONObject("seriesDetail") ?: throw IOException("剧集详情暂不可用")
         val raw=o.optJSONArray("vid_list") ?: throw IOException("分集暂不可用")
         val episodes=(0 until raw.length()).map { raw.getString(it) }
         if(episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size!=episodes.size) throw IOException("分集数据异常")
-        return Detail(card(o).copy(id=id),episodes)
+        val series=card(o).copy(id=id)
+        return Detail(series,episodes,related(html,series),sameName(series))
     }
+    // The detail page has no dedicated same-name group, so other seasons are collected by searching the
+    // website for the season-independent base title and keeping every entry that shares that base name.
+    private fun sameName(current: Series): List<Series> {
+        val base=baseName(current.title); if(base.isBlank()) return emptyList()
+        val page=runCatching { webSearch(base,1,null) }.getOrNull() ?: return emptyList()
+        return page.items.filter { it.id!=current.id && baseName(it.title)==base }
+            .distinctBy { it.id }.sortedBy { seasonNumber(it.title) }.take(12)
+    }
+    private fun baseName(title: String)=title.replace(SeasonPattern,"").trim().trim('：',':','-','·',' ')
+    private fun seasonNumber(title: String): Int {
+        val matched=SeasonPattern.find(title)?.groupValues?.get(1) ?: return Int.MAX_VALUE
+        return chineseNumber(matched)
+    }
+    private fun chineseNumber(text: String): Int {
+        text.toIntOrNull()?.let { return it }
+        val digits=mapOf('一' to 1,'二' to 2,'三' to 3,'四' to 4,'五' to 5,'六' to 6,'七' to 7,'八' to 8,'九' to 9)
+        val ten=text.indexOf('十')
+        if(ten<0) return text.singleOrNull()?.let { digits[it] } ?: Int.MAX_VALUE
+        val high=if(ten==0) 1 else digits[text.first()] ?: 1
+        val low=if(ten==text.lastIndex) 0 else digits[text.last()] ?: 0
+        return high*10+low
+    }
+    // The detail page embeds its recommendation payload as an HTML-escaped JSON array inside the
+    // `data-fn-args` attribute, separate from _ROUTER_DATA. Same-name entries (other seasons) sort first.
+    private fun related(html: String,current: Series): List<Series> {
+        val marker="data-fn-args=\""
+        val start=html.indexOf(marker); if(start<0) return emptyList()
+        val from=start+marker.length; val end=html.indexOf('"',from); if(end<0) return emptyList()
+        val args=runCatching {
+            JSONArray(decodeEntities(html.substring(from,end)))
+                .optJSONArray(1)?.optJSONObject(0)?.optJSONArray("routerDataFnArgs")?.optString(0).orEmpty()
+        }.getOrNull() ?: return emptyList()
+        if(args.isEmpty()) return emptyList()
+        val groups=runCatching { JSONObject(args).optJSONObject("recommendationGroups") }.getOrNull() ?: return emptyList()
+        val rows=groups.optJSONArray("related_list") ?: groups.optJSONArray("hot_list") ?: return emptyList()
+        val items=valid(rows.objects().map(::card)).filter { it.id!=current.id }
+        val key=current.title.trim()
+        if(key.isEmpty()) return items
+        return items.sortedBy { item ->
+            when {
+                item.title.equals(key,ignoreCase=true) -> 0
+                item.title.startsWith(key) || key.startsWith(item.title) -> 1
+                else -> 2
+            }
+        }
+    }
+    private fun decodeEntities(value: String) = value.replace("&quot;","\"").replace("&lt;","<").replace("&gt;",">").replace("&#39;","'").replace("&amp;","&")
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
+        VendorConstants.regenerate()
         val payload="""{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]}}""".toByteArray()
         val signed=signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/",VendorConstants.device,payload)
         val data=JSONObject(text(signed.url,signed))
@@ -159,8 +243,11 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return StreamInfo(url,key,quality)
     }
     companion object {
-        // Website search mixes genres; video_data.genre 203 marks 漫剧 (205 is 短剧), observed 2026-10.
-        private const val COMIC_WEB_GENRE="203"
+        // 网站搜索混合两类内容：video_data.genre 205 是漫剧，203 是短剧
+        // （2026-10-13 用站点自带的漫剧热播榜与短剧分类列表逐条核对确认）。
+        private const val COMIC_WEB_GENRE="205"
+        private const val SHORT_WEB_GENRE="203"
+        private val SeasonPattern=Regex("第([0-9零〇一二三四五六七八九十百千]+)(?:季|部)")
         fun extractRouter(html: String): JSONObject {
             val marker=html.indexOf("_ROUTER_DATA"); if(marker<0) throw IOException("页面没有内容数据")
             val first=html.indexOf('{',marker); if(first<0) throw IOException("页面数据格式错误")
