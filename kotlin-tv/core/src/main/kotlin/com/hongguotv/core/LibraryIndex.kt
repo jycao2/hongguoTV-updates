@@ -71,13 +71,14 @@ class LibraryIndex(data: BackupData, updates: Map<String, FavoriteUpdate> = empt
         watchedIds = watchedIds - id
     }
     fun clearHistory() { historyRows = emptyList(); progressById.clear(); watchedIds = emptySet() }
-    fun observeFavorite(id: String, count: Int, now: Long, acknowledge: Boolean): Boolean {
+    fun observeFavorite(id: String, count: Int, now: Long, acknowledge: Boolean, newSeason: Series? = null): Boolean {
         if (!favorite(id)) return false
         val previous = updateRows[id]
-        val next = previous?.observe(count, now, acknowledge) ?: FavoriteUpdate.first(count, now)
+        var next = previous?.observe(count, now, acknowledge) ?: FavoriteUpdate.first(count, now)
+        if (!acknowledge) next = next.observeNewSeason(newSeason?.id, newSeason?.title, now)
         if (previous == next) return false
         updateRows = updateRows + (id to next)
-        updateCount += (if (next.added > 0) 1 else 0) - (if ((previous?.added ?: 0) > 0) 1 else 0)
+        updateCount += (if (next.hasUpdate) 1 else 0) - (if (previous?.hasUpdate == true) 1 else 0)
         return true
     }
     fun snapshot() = BackupData(favoriteRows, historyRows, watchedIds, searchRows, settings, laterRows, hiddenIds)
@@ -103,7 +104,7 @@ object LibraryDisk {
         val updates = rawUpdates.keys().asSequence().mapNotNull { id -> FavoriteUpdate.decode(rawUpdates.optJSONObject(id))?.let { id to it } }.toMap()
         val settings = BackupSettings(PlaybackQuality.normalize((values["quality"] as? Number)?.toInt() ?: 1080),
             PlaybackSpeed.normalize((values["playbackSpeed"] as? Number)?.toFloat() ?: 1f), values["autoNext"] as? Boolean ?: true,
-            ContentType.fromStored(values["contentType"] as? String), VideoFrameMode.fromStored(values["frameMode"] as? String))
+            ContentType.fromStored(values["contentType"] as? String), VideoFrameMode.fromStored(values["frameMode"] as? String), values["autoSeason"] as? Boolean ?: true)
         return LibraryIndex(BackupData(series("favorites"), history, ids("watched"),
             SearchHistory.decode(values["searches"] as? String ?: "[]"), settings, series("later"), ids("hidden")), updates)
     }
