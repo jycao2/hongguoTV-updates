@@ -1,10 +1,6 @@
 name: Verify Kotlin standalone APK
 on:
-  push:
-    branches: ['codex/kotlin-standalone']
-    tags: ['kotlin-v*']
-  pull_request:
-    paths: ['kotlin-tv/**', 'scripts/build-kotlin.sh', '.github/workflows/kotlin-native.yml']
+  # 镜像仓库只承载旧客户端更新资产，禁止任何自动构建/发布，需要时手动触发
   workflow_dispatch:
 permissions:
   contents: read
