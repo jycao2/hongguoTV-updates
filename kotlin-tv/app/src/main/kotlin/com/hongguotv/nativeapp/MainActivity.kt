@@ -45,6 +45,15 @@ class MainActivity: Activity() {
     private val main=Handler(Looper.getMainLooper())
     private val io=Executors.newFixedThreadPool(3)
     private val repository=ContentRepository()
+    private val randomRecommender by lazy {
+        val raw=getSharedPreferences("random_pool", MODE_PRIVATE).getString("pool", null)
+        val items=raw?.let { RandomPoolSnapshot.decode(it, System.currentTimeMillis()) } ?: emptyList()
+        RandomRecommender(repository, items)
+    }
+    private var randomReplenishing=false
+    private var randomDialog: AlertDialog?=null
+    private var exitDialog: AlertDialog?=null
+    private var killOnDestroy=false
     private val danmakuRepo=DanmakuRepository(repository.http)
     private val networkCleanup=Executors.newSingleThreadExecutor()
     private val prefetchWorker=Executors.newSingleThreadExecutor()
@@ -244,6 +253,7 @@ class MainActivity: Activity() {
         super.onCreate(state)
         window.decorView.systemUiVisibility=View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         library=Library(this); artwork=ArtworkLoader(this); tvTools=TvTools(this); root=FrameLayout(this).apply { setBackgroundColor(bg) }; setContentView(root)
+        InstallStatsPing.startOnce(applicationContext)
         backdropView=ImageView(this).apply { scaleType=ImageView.ScaleType.FIT_XY; importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO }
         loadBackdrop()
         updater=AppUpdater(this) { foreground && library.isLoaded && screen=="catalog" && !tvTools.showing }
@@ -270,6 +280,11 @@ class MainActivity: Activity() {
         backdropView?.takeIf { backdropBitmap!=null }?.let { root.addView(it,FrameLayout.LayoutParams(-1,-1)) }
         val container=column(); val horizontal=dp(widthDp()*.05f); val vertical=(resources.displayMetrics.heightPixels*.05f).toInt()
         container.setPadding(horizontal,vertical,horizontal,vertical); root.addView(container,FrameLayout.LayoutParams(-1,-1))
+        // 本地测试包（versionName 不含 +构建号）右上角常驻 beta 标记，与正式包区分；播放页不显示
+        if(!BuildConfig.VERSION_NAME.contains('+')) {
+            root.addView(text("beta",12f,accent).apply { importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO; isFocusable=false },
+                FrameLayout.LayoutParams(-2,-2,Gravity.TOP or Gravity.END).apply { topMargin=dp(10); rightMargin=dp(14) })
+        }
         if(title!=null) { val heading=row(); addButton(heading,"‹ 返回") { goBack() }; heading.addView(text(title,22f).apply { setTypeface(null,Typeface.BOLD); gravity=Gravity.CENTER_VERTICAL },lp(0,dp(44)).apply { weight=1f }); container.addView(heading) }
         return container
     }
@@ -376,7 +391,8 @@ class MainActivity: Activity() {
         val brand=row()
         brand.addView(ImageView(this).apply { setImageResource(com.hongguotv.nativeapp.R.drawable.app_icon) },lp(dp(28),dp(28)).apply { rightMargin=dp(9) })
         brand.addView(text("红果",22f).apply { typeface=Typeface.create("sans-serif-medium",Typeface.NORMAL) })
-        top.addView(brand,lp(dp(120),dp(44)))
+        brand.addView(text("v${BuildConfig.VERSION_NAME.substringBefore('+')}",12f,muted).apply { setPadding(dp(5),0,0,dp(9)) },lp(-2,-2).apply { gravity=Gravity.BOTTOM })
+        top.addView(brand,lp(dp(172),dp(44)))
         listOf("首页","搜索","排行榜","收藏","最近观看","设置").forEachIndexed { index,label ->
             val item=addButton(top,label,index==tab) { switchTab(index) }
             fun paint(focused: Boolean) {
@@ -401,6 +417,7 @@ class MainActivity: Activity() {
             }
             if(tab==0) {
                 genreButton=addButton(types,genre?.let { "题材 · ${it.name}" } ?: "题材") { showGenrePicker() }.apply { nextFocusUpId=nav[tab].id }
+                addButton(types,"随机") { showRandomPicks() }.apply { nextFocusUpId=nav[tab].id }
             }
             if(inlineHomeFilters()) {
                 top.addView(Space(this),lp(0,1).apply { weight=1f })
@@ -419,9 +436,7 @@ class MainActivity: Activity() {
             searchInput=input; searchButton=addButton(searchRow,"搜索") { search() }; input.nextFocusUpId=typeButtons.getValue(library.contentType).id; searchButton?.nextFocusUpId=input.nextFocusUpId
             lateinit var recent: TextView
             recent=addButton(searchRow,"历史") { showSearchHistory(recent) }; recent.nextFocusUpId=input.nextFocusUpId
-            lateinit var phone: TextView
-            phone=addButton(searchRow,"手机输入") { (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(input.windowToken,0); tvTools.phoneInput(phone) { runSearch(it) } }; phone.nextFocusUpId=input.nextFocusUpId
-            searchActions.addAll(listOf(recent,phone))
+            searchActions.addAll(listOf(recent))
             typeButtons.values.forEach { it.nextFocusDownId=input.id }
             input.setOnEditorActionListener { _,_,_-> search(); true }; container.addView(searchRow)
             input.addTextChangedListener(object: android.text.TextWatcher {
@@ -429,24 +444,53 @@ class MainActivity: Activity() {
                 override fun onTextChanged(s: CharSequence?,start: Int,before: Int,count: Int) {}
                 override fun afterTextChanged(s: android.text.Editable?) { scheduleSuggest() }
             })
-            val keyViews=mutableListOf<TextView>()
-            (('A'..'Z').map { it.toString() }+listOf("删除","清空")).chunked(7).forEach { rowKeys ->
+            fun azKey(label: String): TextView {
+                val view=button(label) { onAzKey(label) }
+                view.textSize=13f; view.minHeight=dp(36); view.setPadding(dp(4),dp(6),dp(4),dp(6))
+                return view
+            }
+            // 字母键盘在左（每行7键），数字键盘在右（1-9三行+0一行），左右区域同行互访
+            val keyboardRow=row()
+            val letterColumn=column()
+            val letterRows=((('A'..'Z').map { it.toString() })+listOf("删除","清空")).chunked(7).map { rowKeys ->
                 val line=row().apply { setPadding(0,0,0,dp(4)) }
-                rowKeys.forEach { key ->
-                    val view=button(key) { onAzKey(key) }
-                    view.textSize=13f; view.minHeight=dp(36); view.setPadding(dp(4),dp(6),dp(4),dp(6))
-                    keyViews+=view
-                    line.addView(view,lp(0,-2).apply { weight=1f; rightMargin=dp(6) })
+                val views=rowKeys.map { key -> azKey(key).also { line.addView(it,lp(0,-2).apply { weight=1f; rightMargin=dp(6) }) } }
+                letterColumn.addView(line)
+                views
+            }
+            keyboardRow.addView(letterColumn,lp(0,-2).apply { weight=1f; rightMargin=dp(6) })
+            val digitColumn=column()
+            val digitRows=listOf(listOf("1","2","3"),listOf("4","5","6"),listOf("7","8","9"),listOf("0")).map { rowKeys ->
+                val line=row().apply { setPadding(0,0,0,dp(4)) }
+                val views=rowKeys.map { key -> azKey(key).also { line.addView(it,lp(dp(52),-2).apply { rightMargin=dp(6) }) } }
+                digitColumn.addView(line)
+                views
+            }.toMutableList()
+            // 手机输入按钮并入数字键盘末行（0 右侧），样式与数字键一致
+            lateinit var phone: TextView
+            phone=button("手机输入") { (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(input.windowToken,0); tvTools.phoneInput(phone) { runSearch(it) } }
+            phone.textSize=13f; phone.minHeight=dp(36); phone.setPadding(dp(8),dp(6),dp(8),dp(6))
+            (digitRows.last().first().parent as LinearLayout).addView(phone,lp(dp(110),-2))
+            digitRows[digitRows.size-1]=digitRows.last()+phone
+            keyboardRow.addView(digitColumn,lp(-2,-2))
+            container.addView(keyboardRow)
+            letterRows.forEachIndexed { r,views ->
+                views.forEachIndexed { c,key ->
+                    key.nextFocusLeftId=views[if(c==0) 0 else c-1].id
+                    key.nextFocusRightId=if(c==views.size-1) digitRows[r].first().id else views[c+1].id
+                    key.nextFocusUpId=if(r==0) input.id else letterRows[r-1][c].id
+                    key.nextFocusDownId=if(r==letterRows.size-1) key.id else letterRows[r+1][c].id
                 }
-                container.addView(line)
             }
-            keyViews.forEachIndexed { index,key ->
-                key.nextFocusLeftId=keyViews[if(index%7==0) index else index-1].id
-                key.nextFocusRightId=keyViews[if(index%7==6) index else index+1].id
-                key.nextFocusUpId=if(index<7) input.id else keyViews[index-7].id
-                key.nextFocusDownId=if(index+7<keyViews.size) keyViews[index+7].id else key.id
+            digitRows.forEachIndexed { r,views ->
+                views.forEachIndexed { c,key ->
+                    key.nextFocusLeftId=if(c==0) letterRows[r].last().id else views[c-1].id
+                    key.nextFocusRightId=views[if(c==views.size-1) c else c+1].id
+                    key.nextFocusUpId=if(r==0) input.id else digitRows[r-1][minOf(c,digitRows[r-1].size-1)].id
+                    key.nextFocusDownId=if(r==digitRows.size-1) key.id else digitRows[r+1][minOf(c,digitRows[r+1].size-1)].id
+                }
             }
-            azFirst=keyViews.first(); azLastRow.addAll(keyViews.takeLast(7))
+            azFirst=letterRows.first().first(); azLastRow.addAll(letterRows.last()+digitRows.last())
             val suggestScroll=HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled=false; isFocusable=false }
             val suggestLine=row()
             suggestScroll.addView(suggestLine)
@@ -610,7 +654,7 @@ class MainActivity: Activity() {
     }
     private fun maybeLoadMore() {
         val adapter=catalogAdapter ?: return
-        if(loadingMore || !hasMore || localCatalog() || screen!="catalog") return
+        if(randomDialog?.isShowing==true || loadingMore || !hasMore || localCatalog() || screen!="catalog") return
         if(page>=waterfallMaxPages || catalog.size>=waterfallMaxPages*20) { hasMore=false; adapter.updateFooter(FOOTER_END); return }
         val requestTab=tab; val requestPage=page+1; val requestQuery=query; val requestType=library.contentType
         val requestBoard=rankBoard; val requestGenre=if(requestTab==0) genre else null
@@ -1055,6 +1099,137 @@ class MainActivity: Activity() {
         tvTools.choose("搜索历史",history.map { "${it.type.label} · ${it.query}" },anchor,{ index -> runSearch(history[index].query,history[index].type) },"清空历史") {
             tvTools.confirm("清空搜索历史","清除本机保存的搜索词？",anchor) { library.clearSearches() }
         }
+    }
+    private fun showRandomPicks() {
+        if(randomDialog?.isShowing==true) return
+        val picks=randomRecommender.pick(12)
+        if(picks.isNotEmpty()) { showRandomDialog(picks); return }
+        // 池空或近期都展示过：先补充再展示
+        showRandomDialog(emptyList(), loading = true)
+        replenishRandomPool {
+            val next=randomRecommender.pick(12)
+            if(next.isNotEmpty()) showRandomDialog(next) else randomDialog?.dismiss().also { Toast.makeText(this,"暂时无法随机荐剧，请稍后重试",Toast.LENGTH_SHORT).show() }
+        }
+    }
+
+    private fun replenishRandomPool(onDone: () -> Unit) {
+        if(randomReplenishing) return
+        randomReplenishing=true
+        io.execute {
+            val added=runCatching { randomRecommender.replenish() }.getOrDefault(0)
+            if(added>0) {
+                val encoded=RandomPoolSnapshot.encode(randomRecommender.snapshot(), System.currentTimeMillis())
+                getSharedPreferences("random_pool", MODE_PRIVATE).edit().putString("pool", encoded).apply()
+            }
+            main.post { randomReplenishing=false; if(!isDestroyed) onDone() }
+        }
+    }
+
+    private fun showRandomDialog(items: List<Series>, loading: Boolean=false) {
+        randomDialog?.dismiss()
+        val body=column().apply { setPadding(dp(16),dp(12),dp(16),dp(8)) }
+        val title=text(if(loading) "正在随机挑选…" else "随机荐剧",20f).apply { setTypeface(null,Typeface.BOLD); setPadding(0,0,0,dp(10)) }
+        body.addView(title)
+        val content=FrameLayout(this)
+        body.addView(content,lp(-1,dp(420)).apply { bottomMargin=dp(10) })
+        val dlg=AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(body) })
+            .setPositiveButton("换一批",null).setNegativeButton("关闭",null).create()
+        randomDialog=dlg
+        dlg.show()
+        if(items.isEmpty() && !loading) {
+            content.addView(text("候选池为空，正在补充…",15f,muted).apply { setPadding(0,dp(20),0,0) })
+        } else if(items.isNotEmpty()) {
+            // 弹窗专用固定尺寸卡片：宽120dp，上图（3:4固定高）下名称+集数，小图拉伸撑满
+            val cardWidth=dp(120)
+            val posterHeight=(cardWidth/TvStyle.POSTER_ASPECT).toInt()
+            val randomAdapter=object: RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+                override fun getItemCount()=items.size
+                override fun onCreateViewHolder(parent: ViewGroup,viewType: Int): RecyclerView.ViewHolder {
+                    val card=column(); card.setPadding(dp(4),dp(4),dp(4),dp(9)); focusStyle(card)
+                    val image=ImageView(this@MainActivity).apply { scaleType=ImageView.ScaleType.FIT_XY; importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO }
+                    card.addView(image,lp(-1,posterHeight))
+                    val title=text("",13f).apply { maxLines=2; minLines=2; ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),dp(6),dp(3),0) }
+                    val badge=text("",11f,muted).apply { maxLines=1; minLines=1; minHeight=dp(17); ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),0,0,0) }
+                    card.addView(title,lp(-1,-2)); card.addView(badge,lp(-1,-2))
+                    card.layoutParams=RecyclerView.LayoutParams(cardWidth,-2).apply { rightMargin=dp(12); bottomMargin=dp(10) }
+                    return object: RecyclerView.ViewHolder(card) {}
+                }
+                override fun onBindViewHolder(holder: RecyclerView.ViewHolder,position: Int) {
+                    val item=items[position]; val card=holder.itemView as LinearLayout
+                    val image=card.getChildAt(0) as ImageView
+                    val title=card.getChildAt(1) as TextView
+                    val badge=card.getChildAt(2) as TextView
+                    card.contentDescription=item.title
+                    loadCover(image,item.cover)
+                    title.text=item.title; badge.text=item.badge
+                    card.setOnClickListener { randomDialog?.dismiss(); openDetail(item,false) }
+                    card.setOnFocusChangeListener { _,focused -> card.background=TvStyle.card(this@MainActivity,focused); if(focused) loadCover(image,item.cover) }
+                }
+            }
+            val grid=GridLayoutManager(this,4)
+            val recycler=RecyclerView(this).apply { clipToPadding=false; itemAnimator=null }
+            recycler.layoutManager=grid; recycler.adapter=randomAdapter
+            content.addView(recycler,lp(-1,-1))
+        }
+        // 「换一批」按钮
+        dlg.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
+            text="换一批"
+            setOnClickListener {
+                dlg.dismiss()
+                val picks=randomRecommender.pick(12)
+                if(picks.isNotEmpty()) showRandomDialog(picks)
+                else { showRandomDialog(emptyList(), loading = true); replenishRandomPool { val n=randomRecommender.pick(12); if(n.isNotEmpty()) showRandomDialog(n) } }
+            }
+        }
+        if(loading) {
+            // 补充完成后调用方会重新 showRandomDialog(items) 覆盖这个 loading 框
+        }
+    }
+    // 退出前二次确认：收藏有更新优先展示，否则从随机荐剧池取 3 部；都没有就直接退出
+    private fun showExitConfirm() {
+        if(exitDialog?.isShowing==true) return
+        val updates=library.updates()
+        val updated=library.favorites().filter { (updates[it.id]?.added ?: 0) > 0 }.take(3)
+        val fromUpdates=updated.isNotEmpty()
+        // 收藏更新优先，其次随机荐剧池，最后退化到首页 7 天缓存随机抽 3 部，全部为本地数据
+        val items=if(fromUpdates) updated else randomRecommender.pick(3).ifEmpty { library.cachedHome(library.contentType)?.items?.shuffled()?.take(3) ?: emptyList() }
+        val body=column().apply { setPadding(dp(16),dp(12),dp(16),dp(8)) }
+        body.addView(text(if(fromUpdates) "收藏更新，看完再走？" else if(items.isNotEmpty()) "猜你喜欢，再看一会儿？" else "确定要退出红果TV吗？",20f).apply { setTypeface(null,Typeface.BOLD); gravity=Gravity.CENTER; setPadding(0,0,0,dp(14)) },lp(-1,-2))
+        val cardWidth=dp(120)
+        val posterHeight=(cardWidth/TvStyle.POSTER_ASPECT).toInt()
+        val cards=row()
+        items.forEach { item ->
+            val card=column(); card.setPadding(dp(4),dp(4),dp(4),dp(9)); focusStyle(card)
+            val image=ImageView(this).apply { scaleType=ImageView.ScaleType.FIT_XY; importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO }
+            card.addView(image,lp(-1,posterHeight))
+            val cardTitle=text("",13f).apply { maxLines=2; minLines=2; ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),dp(6),dp(3),0) }
+            val badge=text("",11f,muted).apply { maxLines=1; minLines=1; minHeight=dp(17); ellipsize=TextUtils.TruncateAt.END; setPadding(dp(3),0,0,0) }
+            card.addView(cardTitle,lp(-1,-2)); card.addView(badge,lp(-1,-2))
+            card.contentDescription=item.title
+            loadCover(image,item.cover)
+            cardTitle.text=item.title; badge.text=if(fromUpdates) library.favoriteLabel(item.id) else item.badge
+            card.setOnClickListener { exitDialog?.dismiss(); openDetail(item,false) }
+            card.setOnFocusChangeListener { _,focused -> card.background=TvStyle.card(this,focused); if(focused) loadCover(image,item.cover) }
+            cards.addView(card,lp(cardWidth,-2).apply { rightMargin=dp(12) })
+        }
+        if(items.isNotEmpty()) body.addView(cards,lp(-2,-2).apply { gravity=Gravity.CENTER_HORIZONTAL })
+        else body.addView(ImageView(this).apply { setImageResource(R.drawable.exit_placeholder); importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO },
+            lp(dp(200),dp(200)).apply { gravity=Gravity.CENTER_HORIZONTAL; bottomMargin=dp(8) })
+        val dlg=AlertDialog.Builder(this).setView(body)
+            .setPositiveButton("再看一会儿",null).setNegativeButton("退出不看了",null).create()
+        exitDialog=dlg
+        dlg.show()
+        // 隐藏系统按钮栏，换居中圆角按钮：左「退出不看了」弱化，右「再看一会儿」高亮并默认聚焦
+        (dlg.getButton(AlertDialog.BUTTON_POSITIVE)?.parent as? View)?.visibility=View.GONE
+        // 先落盘再走正常 onDestroy 排水，最后杀进程，避免丢失未提交的观看记录
+        val exitButton=button("退出不看了") { killOnDestroy=true; library.flush(); dlg.dismiss(); finish() }
+        val stayButton=button("再看一会儿",true) { dlg.dismiss() }
+        val buttons=row().apply {
+            addView(exitButton,lp(-2,-2)); addView(stayButton,lp(-2,-2).apply { leftMargin=dp(24) })
+        }
+        body.addView(buttons,lp(-2,-2).apply { gravity=Gravity.CENTER_HORIZONTAL; topMargin=dp(14); bottomMargin=dp(6) })
+        stayButton.requestFocus()
+        dlg.setOnDismissListener { exitDialog=null }
     }
     private fun showGenrePicker() {
         val anchor=genreButton ?: return
@@ -1782,7 +1957,7 @@ class MainActivity: Activity() {
         when(screen) {
             "player" -> if(player?.playbackState==Player.STATE_ENDED) returnToDetail() else if(hud.visibility==View.VISIBLE && !playError) hidePlaybackOverlay() else returnToDetail()
             "detail" -> showCatalog()
-            else -> if(collection!=null) { leaveCollection(); showCatalog() } else if(nav.any { it.hasFocus() }) { if(tab!=0) { switchTab(0); nav[0].requestFocus() } else finish() } else nav.getOrNull(tab)?.requestFocus()
+            else -> if(collection!=null) { leaveCollection(); showCatalog() } else if(nav.any { it.hasFocus() }) { if(tab!=0) { switchTab(0); nav[0].requestFocus() } else showExitConfirm() } else nav.getOrNull(tab)?.requestFocus()
         }
     }
     @Deprecated("TV remote back is handled through the activity")
@@ -1873,5 +2048,6 @@ class MainActivity: Activity() {
         io.shutdownNow(); prefetchWorker.shutdownNow(); networkCleanup.shutdown()
         Thread({ repository.http.dispatcher.cancelAll(); repository.http.connectionPool.evictAll(); repository.http.dispatcher.executorService.shutdown() },"hongguotv-network-cleanup").start()
         super.onDestroy()
+        if(killOnDestroy) android.os.Process.killProcess(android.os.Process.myPid())
     }
 }

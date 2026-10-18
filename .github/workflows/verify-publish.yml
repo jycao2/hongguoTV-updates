@@ -1,9 +1,7 @@
-name: Verify and publish Docker
+﻿name: Verify and publish Docker
 
 on:
-  # 镜像仓库只承载旧客户端更新资产，禁止任何自动构建/发布，需要时手动触发
   workflow_dispatch:
-
 permissions:
   contents: read
 
