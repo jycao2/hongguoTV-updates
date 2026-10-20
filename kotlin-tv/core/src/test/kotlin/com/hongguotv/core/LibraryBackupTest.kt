@@ -40,6 +40,42 @@ class LibraryBackupTest {
         val legacy=JSONObject(LibraryBackup.encode(data())); legacy.getJSONObject("settings").remove("autoSeason")
         assertTrue(LibraryBackup.decode(legacy.toString()).settings.autoSeason)
     }
+    @Test fun `clock setting round trips and legacy backups default to hidden`() {
+        val on=data().copy(settings=BackupSettings().copy(showClock=true))
+        assertEquals(on,LibraryBackup.decode(LibraryBackup.encode(on)))
+        val legacy=JSONObject(LibraryBackup.encode(data())); legacy.getJSONObject("settings").remove("showClock")
+        assertFalse(LibraryBackup.decode(legacy.toString()).settings.showClock)
+        assertTrue(LibraryBackup.merge(data(),on,true).settings.showClock)
+    }
+    @Test fun `source hidden setting round trips and legacy backups default to hidden`() {
+        val shown=data().copy(settings=BackupSettings().copy(sourceHidden=false))
+        assertEquals(shown,LibraryBackup.decode(LibraryBackup.encode(shown)))
+        val legacy=JSONObject(LibraryBackup.encode(data())); legacy.getJSONObject("settings").remove("sourceHidden")
+        assertTrue(LibraryBackup.decode(legacy.toString()).settings.sourceHidden)
+        assertFalse(LibraryBackup.merge(data(),shown,true).settings.sourceHidden)
+    }
+    @Test fun `third history round trips and legacy backups default to empty`() {
+        val hit=BackupThirdHistory("https://a.com/api.php/provide/vod","示例源","42","测试影片","https://a.com/1.jpg",
+            2,"第3集",12000,60000,1792448000000,false)
+        val withHistory=data().copy(thirdHistory=listOf(hit))
+        assertEquals(withHistory.thirdHistory,LibraryBackup.decode(LibraryBackup.encode(withHistory)).thirdHistory)
+        val legacy=JSONObject(LibraryBackup.encode(data())); legacy.remove("thirdHistory")
+        assertTrue(LibraryBackup.decode(legacy.toString()).thirdHistory.isEmpty())
+    }
+    @Test fun `broken third history entries are skipped without failing the backup`() {
+        val base=JSONObject(LibraryBackup.encode(data()))
+        base.put("thirdHistory",JSONArray().put(JSONObject().put("videoId","1")).put(JSONObject().put("sourceApi","https://a.com/api").put("videoId","7")).put("broken"))
+        val decoded=LibraryBackup.decode(base.toString())
+        assertEquals(1,decoded.thirdHistory.size)
+        val wrongType=JSONObject(LibraryBackup.encode(data())).put("thirdHistory","broken")
+        assertTrue(LibraryBackup.decode(wrongType.toString()).thirdHistory.isEmpty())
+    }
+    @Test fun `third history merge keeps the newest progress per video`() {
+        val old=BackupThirdHistory("https://a.com/api","A","1","剧","",0,"第1集",1000,60000,100,false)
+        val fresh=old.copy(episodeIndex=1,positionMs=2000,updatedAt=200)
+        val merged=LibraryBackup.merge(data().copy(thirdHistory=listOf(fresh)),data().copy(thirdHistory=listOf(old)),true).thirdHistory
+        assertEquals(1,merged.size); assertEquals(2000L,merged.first().positionMs)
+    }
     @Test fun `danmaku prefs round trip and out of range values normalize`() {
         val custom=data().copy(settings=BackupSettings().copy(danmakuOpacity=60,danmakuFont=0,danmakuSpeed=4,danmakuRows=5))
         assertEquals(custom,LibraryBackup.decode(LibraryBackup.encode(custom)))
@@ -73,6 +109,35 @@ class LibraryBackupTest {
         reject { it.getJSONObject("favoriteGroups").put("notAnId","a") }
         reject { it.getJSONObject("favoriteGroups").put("1","") }
         reject { it.getJSONObject("favoriteGroups").put("1",1) }
+    }
+    @Test fun `third sources round trip merge keeps local and legacy backups stay empty`() {
+        val original=data().copy(thirdSources=listOf(BackupThirdSource("量子","https://a.example.com/api.php/provide/vod")))
+        assertEquals(original,LibraryBackup.decode(LibraryBackup.encode(original)))
+        val legacy=JSONObject(LibraryBackup.encode(data())); legacy.remove("thirdSources")
+        assertTrue(LibraryBackup.decode(legacy.toString()).thirdSources.isEmpty())
+        val broken=JSONObject(LibraryBackup.encode(data()))
+        broken.put("thirdSources",JSONArray().put(JSONObject().put("name","坏源").put("api","ftp://x"))
+            .put(JSONObject().put("api","https://b.example.com/vod")))
+        val decoded=LibraryBackup.decode(broken.toString()).thirdSources
+        assertEquals(listOf("https://b.example.com/vod"),decoded.map { it.api })
+        assertEquals("b.example.com",decoded.single().name)
+        val local=data().copy(thirdSources=listOf(BackupThirdSource("本地","https://a.example.com/vod")))
+        val incoming=data().copy(thirdSources=listOf(BackupThirdSource("备份名","https://a.example.com/vod"),BackupThirdSource("新源","https://b.example.com/vod")))
+        val merged=LibraryBackup.merge(local,incoming,false).thirdSources
+        assertEquals(listOf("https://a.example.com/vod","https://b.example.com/vod"),merged.map { it.api })
+        assertEquals("本地",merged.first().name)
+    }
+    @Test fun `source config encode decode caps entries and rejects invalid ones`() {
+        val list=(1..3).map { BackupThirdSource("源$it","https://s$it.example.com/api.php/provide/vod") }
+        assertEquals(list,ThirdSourceConfig.decode(ThirdSourceConfig.encode(list)))
+        assertEquals(ThirdSourceConfig.MAX,ThirdSourceConfig.decode(ThirdSourceConfig.encode((1..40).map { BackupThirdSource("源$it","https://s$it.example.com/vod") })).size)
+        assertTrue(ThirdSourceConfig.decode("not json").isEmpty())
+        assertTrue(ThirdSourceConfig.decode("""{"format":"other","sources":[]}""").isEmpty())
+        assertTrue(ThirdSourceConfig.decode("x".repeat(ThirdSourceConfig.MAX_BYTES+1)).isEmpty())
+        val raw="""{"format":"hongguotv.third-sources","version":1,"sources":[{"name":"A","api":"ftp://x"},{"name":"B","api":"https://a.example.com/vod"},{"name":"C","api":"https://a.example.com/vod"},{"name":"","api":"https://b.example.com/vod"}]}"""
+        val decoded=ThirdSourceConfig.decode(raw)
+        assertEquals(listOf("https://a.example.com/vod","https://b.example.com/vod"),decoded.map { it.api })
+        assertEquals("b.example.com",decoded[1].name)
     }
     @Test fun `invalid format ranges settings duplicates and oversized nesting are rejected`() {
         fun reject(change: (JSONObject)->Unit) { val o=JSONObject(LibraryBackup.encode(data())); change(o); assertTrue(o.toString(),runCatching { LibraryBackup.decode(o.toString()) }.isFailure) }
