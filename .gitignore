@@ -1,8 +1,41 @@
+# Local machine and IDE files
+.DS_Store
+.idea/
+*.iml
 local.properties
-keystore.properties
-*.jks
-*.keystore
+
+# Build and dependency output
 .gradle/
 .kotlin/
 build/
-outputs/
+dist/
+node_modules/
+.venv/
+__pycache__/
+*.py[cod]
+*.apk
+*.aab
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+keystore.properties
+
+# Local captures and downloaded media
+/captures/
+/downloads/
+/tmp/
+
+# Delivery artifacts, native intermediates, local runtime
+/outputs/
+/server/.local/
+.cxx/
+.externalNativeBuild/
+/ios/Pods/
+/ios/build/
+
+# 手机版为本地实验模块，不入库
+/kotlin-tv/app-phone/

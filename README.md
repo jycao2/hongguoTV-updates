@@ -1,21 +1,35 @@
-# 红果 TV · 原生客户端与自动更新
+# 红果 TV
 
-[下载最新版 APK](https://github.com/jycao2/hongguoTV-updates/releases/latest) · [构建状态](https://github.com/jycao2/hongguoTV-updates/actions/workflows/release.yml)
+自家电视使用的非官方红果短剧客户端，与红果官方无关联。**Kotlin 原生独立 APK**：安装后联网即可浏览播放，无需 Node / Docker / 服务器。最低 Android 8.0（API 26），电视遥控器操作，ARM32 / ARM64 / x86 / x86_64 通用。
 
-Android 8.0+，Kotlin / Media3，单 APK，无需部署服务。非官方、自用电视客户端。
+**[下载最新版 APK](https://github.com/jycao2/hongguoTV/releases/latest)** · [版本记录与构建说明](kotlin-tv/README.md) · [自动更新机制](kotlin-tv/AUTO_UPDATES.md)
 
-首次手动安装带更新功能的正式版后，应用在前台浏览时每 6 小时检查一次新版，下载并校验后提示安装。播放时停止更新请求；无需 GitHub 登录。设置 → 版本与更新可手动检查或关闭自动下载。Android 8 仍需允许本应用安装未知来源应用，并确认系统安装；并非静默安装。
+## 主要功能
 
-保留短剧/漫剧浏览、搜索、收藏、观看记录、续播、选集、全局清晰度与倍速。沿用原发布签名，覆盖安装保留本机数据。平台账号同步尚未接通。
+- **浏览**：首页接着看 / 收藏有更新 / 稍后看 / 热门发现横向剧架，随机荐剧一键换一批，漫剧 / 短剧热播榜，24+8 个题材分类浏览
+- **搜索**：漫剧 / 短剧分类型，联想词、搜索历史、同一局域网手机扫码输入，键盘 / 联想 / 结果三栏同屏
+- **播放**：自动连播、系列剧跨季连播、片头片尾按剧跳过、0.75-2× 倍速、清晰度档位、定时停止、播完推荐
+- **弹幕**：接入平台官方弹幕源，不透明度 / 字号 / 速度 / 行数可调，表情代码自动展开
+- **收藏**：分组管理、更新自动检查与提示
+- **数据**：全部保存在本机；本地自动备份，卸载重装后授权一次即可自动恢复；支持手机扫码导入导出
+- **外观**：深夜影院 / 暖玉白双主题，扫码上传自定义背景
+- **更新**：应用内自动检测与下载，github.com 不通时自动切换国内镜像；覆盖安装保留本机记录
 
-本仓库只包含可发布的原生源码及构建文件，使用 GPL-3.0。main 每次更新会通过 GitHub Actions 运行测试、Release lint，生成签名 APK，再发布 APK、对应源码、update.json 和校验和。源码不包含发布私钥；签名密钥仅配置于 Actions Secrets。
+## 工程结构
 
-构建开发 APK（JDK 17、Android SDK 36）：
+- `kotlin-tv/`：客户端工程（Kotlin + Android 原生 View + Media3），单测、构建与发布说明见其 README
+- `scripts/`：正式包构建与发布脚本
+- `deploy/`：匿名装机统计的云函数部署
+- `docs/`：接口研究、部署与历史交付资料
 
-```sh
-./kotlin-tv/gradlew -p kotlin-tv :core:test :app:assembleDebug
-```
+## 隐私
 
-正式构建使用 `scripts/build-kotlin.sh`；签名配置见 [原生构建说明](kotlin-tv/README.md)。自动版本号为 10000 + workflow run_number，versionName 为 0.9.0+run_number。Release 的 update.json 记录确切版本和源码提交，复现时传入 HONGGUOTV_VERSION_CODE 与 HONGGUOTV_VERSION_NAME。
+应用每次启动向自建腾讯云函数发送一次匿名 GET（随机安装 ID + 版本号），用于估算真实装机量；不收集 IP、机型、观看内容或任何账号信息，失败静默。除此之外无任何第三方统计 / 广告 / 崩溃上报 SDK。详见 [隐私与匿名统计](kotlin-tv/README.md#隐私与匿名统计)。
 
-Android 8 实体电视的解码、音频、遥控器和系统安装入口仍需实机确认。
+## 免责声明
+
+本项目仅做技术交流与学习用途，旨在研究 Android 原生开发、媒体播放、网络请求签名等技术实现，不提供、不存储、不传播任何视频内容。应用内置的第三方 CMS 接口地址仅为技术演示与学习用途，其内容的合法性由对应源站自行负责。
+
+## 许可证
+
+本项目代码按 [GPL-3.0](LICENSE) 提供，第三方部分保留各自许可（见 `kotlin-tv/NOTICE.md`）。
