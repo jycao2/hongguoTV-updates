@@ -215,13 +215,44 @@ class ThirdCmsTest {
         assertEquals("https://a/vod?at=json&ac=detail&wd=%E6%9C%AB%E6%97%A5", ThirdCms.apiUrl("https://a/vod?at=json", listOf("ac" to "detail", "wd" to "末日")))
     }
 
-    // ---------- restoreCandidates ----------
+    // ---------- searchKey / dedupeHits ----------
+
+    private fun detail(id: String, name: String, year: String?, episodes: Int): ThirdDetail {
+        val list = (1..episodes).map { ThirdEpisode("第${it}集", "https://v/$id/$it.m3u8") }
+        return ThirdDetail(ThirdVideo(id, name, "", ""), null, year, null, null, listOf("线路1" to list))
+    }
 
     @Test
-    fun `restoreCandidates 只返回当前不存在的内置源`() {
-        val existing = listOf(ThirdSource("liangzi", "量子", ThirdCms.BUILTIN_SOURCES[0].api, false))
-        val candidates = ThirdCms.restoreCandidates(existing)
-        assertTrue(candidates.none { it.api == ThirdCms.BUILTIN_SOURCES[0].api })
-        assertEquals(7, candidates.size)
+    fun `searchKey 去除书名号空白并统一大小写拼接年份`() {
+        assertEquals("末日重生|2025", ThirdCms.searchKey("《末日 重生》", "2025"))
+        assertEquals("abc|", ThirdCms.searchKey("ABC", null))
+        assertEquals("abc|2024", ThirdCms.searchKey("  abc ", " 2024 "))
+    }
+
+    @Test
+    fun `dedupeHits 同片名年份合并并优先当前源`() {
+        val a = ThirdSource("a", "A源", "https://a/vod")
+        val b = ThirdSource("b", "B源", "https://b/vod")
+        val hits = listOf(
+            ThirdSearchHit(b, detail("1", "末日重生", "2025", 30)),
+            ThirdSearchHit(a, detail("2", "《末日重生》", "2025", 10)),
+            ThirdSearchHit(a, detail("3", "另一部剧", "2024", 5))
+        )
+        val preferred = ThirdCms.dedupeHits(hits, a.api)
+        assertEquals(2, preferred.size)
+        assertEquals("2", preferred[0].detail.video.id)
+        assertEquals("3", preferred[1].detail.video.id)
+        // 无偏好时保留集数更多的 B 源
+        assertEquals("1", ThirdCms.dedupeHits(hits, null)[0].detail.video.id)
+    }
+
+    @Test
+    fun `dedupeHits 年份不同视为不同作品`() {
+        val a = ThirdSource("a", "A源", "https://a/vod")
+        val hits = listOf(
+            ThirdSearchHit(a, detail("1", "同名剧", "2024", 10)),
+            ThirdSearchHit(a, detail("2", "同名剧", "2025", 10))
+        )
+        assertEquals(2, ThirdCms.dedupeHits(hits, null).size)
     }
 }
