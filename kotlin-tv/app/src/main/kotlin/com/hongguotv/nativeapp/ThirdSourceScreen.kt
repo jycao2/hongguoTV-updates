@@ -27,6 +27,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.SeekParameters
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -95,6 +96,8 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     private var lastHistoryBackupAt = 0L
     /** 详情页返回目标：历史/收藏/浏览，避免从二级页面返回时落到浏览页。 */
     private var detailReturnMode = Mode.BROWSE
+    /** 浏览态网格里最近聚焦的卡片（显示用视频 id）：进详情/播放返回时把焦点恢复到这张卡片上。 */
+    private var browseFocusKey: String? = null
     // 本次浏览会话是否已发起过列表请求：空结果分类若再自动重发会形成「请求→空→rebuild→再请求」
     // 死循环，界面持续重建吞掉按键（表现为遥控器卡死）
     private var catalogRequested = false
@@ -160,6 +163,8 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     private var overlayVisible = false
     // 平滑快进快退：按住左右键时虚拟位置按节奏推进并实时渲染关键帧预览，松开才精确定位
     private var scrubbing = false
+    /** ExoPlayer 最近一次带宽估计（bps）：缓冲提示用它显示实时网速。 */
+    private var lastBandwidthBps = 0L
     private var scrubDirection = 0
     private var scrubPositionMs = 0L
     private var scrubStartAt = 0L
@@ -190,6 +195,8 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     }
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(state: Int) {
+            // 缓冲中给出「正在缓冲 + 实时网速」提示，避免慢网卡顿时画面静止却没有任何反馈
+            if(state == Player.STATE_BUFFERING && mode == Mode.PLAY && !scrubbing) showBuffering()
             if(state == Player.STATE_READY) { playLoading?.visibility = View.GONE; updatePlayUi() }
             if(state == Player.STATE_ENDED) { keepScreenOn(false); showOverlay() }
         }
@@ -221,6 +228,18 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     private fun keepScreenOn(on: Boolean) {
         if(on) activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else activity.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    /** 缓冲提示文案：已知带宽时附上实时网速，让用户直观判断是源慢还是本地网络问题。 */
+    private fun bufferText(): String {
+        if(lastBandwidthBps <= 0) return "正在缓冲…"
+        val kbs = lastBandwidthBps / 8 / 1024
+        val speed = if(kbs >= 1024) String.format("%.1f MB/s", kbs / 1024f) else "$kbs KB/s"
+        return "正在缓冲 · $speed"
+    }
+
+    private fun showBuffering() {
+        playLoading?.let { it.text = bufferText(); it.visibility = View.VISIBLE }
     }
 
     // ================= 生命周期 =================
@@ -460,18 +479,27 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         body.addView(gridStatus)
 
         container.addView(body, lp(-1, 0).apply { weight = 1f })
-        // 焦点归属：搜索结果→首张卡片；选中的分类→该分类；空态→「全部」；其余→当前使用的源胶囊
-        // （点源 tab 切换后不要把焦点甩回第一个胶囊）
+        // 焦点归属：从详情返回→上次聚焦的网格卡片；搜索结果→首张卡片；选中的分类→该分类；空态→「全部」；
+        // 其余→当前使用的源胶囊（点源 tab 切换后不要把焦点甩回第一个胶囊）
+        val restorePosition = browseFocusKey?.let { key -> display.indexOfFirst { it.id == key } } ?: -1
         val emptyBrowse = display.isEmpty() && !loading && searchWord == null && loadError == null
         val selectedCategory = if(searchWord == null && categoryId != null) categoryButtons.firstOrNull() else null
         val currentCapsule = capsuleViews.getOrNull(sources.indexOfFirst { it.id == currentId })
         topFocusId = when {
+            restorePosition >= 0 && gridRecycler != null -> gridRecycler!!.id
             selectedCategory != null -> selectedCategory.id
             searchWord != null && gridRecycler != null -> gridRecycler!!.id
             searchWord != null -> search.id
             emptyBrowse && categoryButtons.isNotEmpty() -> categoryButtons[0].id
             currentCapsule != null -> currentCapsule.id
             else -> capsuleViews.firstOrNull()?.id ?: search.id
+        }
+        // 网格是 RecyclerView，卡片要等布局绑定后才存在：先滚动到目标位置，下一帧再把焦点落到那张卡片
+        if(restorePosition >= 0) gridRecycler?.let { recycler ->
+            recycler.post {
+                (recycler.layoutManager as? GridLayoutManager)?.scrollToPositionWithOffset(restorePosition, 0)
+                recycler.post { recycler.findViewHolderForAdapterPosition(restorePosition)?.itemView?.requestFocus() }
+            }
         }
         // 焦点接线：源胶囊 ↓ → 分类（搜索态为重新搜索）；管理 ↓ → 右上角搜索；分类/搜索 ↓ → 网格
         val rowAbove = currentCapsule?.id ?: historyRef?.id ?: favoriteRef?.id ?: manage?.id ?: View.NO_ID
@@ -629,6 +657,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
             holder.card.setOnFocusChangeListener { v, focused ->
                 paint?.onFocusChange(v, focused)
                 holder.name.setTextColor(if(focused) TvStyle.accent else TvStyle.text)
+                if(focused && mode == Mode.BROWSE) browseFocusKey = item.id
                 if(focused && position >= items.size - 3) maybeLoadMore()
             }
             holder.card.setOnClickListener { onOpen?.invoke(item) ?: onVideoClick(item) }
@@ -2116,7 +2145,7 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
     private fun attachPlayer(startMs: Long, autoplay: Boolean) {
         detachPlayerViews()
         // 换集/重建时先停掉进行中的快进预览，并释放可能残存的旧实例，避免音频串音
-        scrubbing = false; main.removeCallbacks(scrubTick)
+        scrubbing = false; main.removeCallbacks(scrubTick); lastBandwidthBps = 0
         player?.let { stale -> stale.removeListener(playerListener); stale.release() }
         player = null
         val data = detail ?: return
@@ -2127,7 +2156,8 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
         val view = PlayerView(activity).apply { useController = false; resizeMode = resizeModeValue(store.resizeMode) }
         playerView = view
         host.addView(view, FrameLayout.LayoutParams(-1, -1))
-        val loading = text("正在加载…", 15f, muted).apply { gravity = Gravity.CENTER }
+        // 加载/缓冲提示用白色：播放器黑底上灰色文字看不清
+        val loading = text("正在加载…", 15f, Color.WHITE).apply { gravity = Gravity.CENTER }
         val errorView = text("", 14f, TvStyle.accent).apply { gravity = Gravity.CENTER; setPadding(0, dp(8), 0, 0) }
         val center = column().apply { gravity = Gravity.CENTER; importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }
         center.addView(loading); center.addView(errorView)
@@ -2139,6 +2169,13 @@ class ThirdSourceScreen(private val activity: Activity, private val rebuild: () 
             .setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
         view.player = instance
         instance.addListener(playerListener)
+        // 带宽估计回调：刷新缓冲提示里的实时网速
+        instance.addAnalyticsListener(object : AnalyticsListener {
+            override fun onBandwidthEstimate(eventTime: AnalyticsListener.EventTime, totalLoadTimeMs: Int, totalBytesLoaded: Long, bitrateEstimate: Long) {
+                lastBandwidthBps = bitrateEstimate
+                if(playLoading?.visibility == View.VISIBLE) showBuffering()
+            }
+        })
         instance.setMediaItem(MediaItem.fromUri(episode.url), startMs.coerceAtLeast(0L))
         instance.prepare()
         instance.setPlaybackSpeed(store.playbackSpeed)
