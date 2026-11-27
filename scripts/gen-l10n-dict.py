@@ -28,6 +28,8 @@ SRC = ROOT / "kotlin-tv"
 OUT = SRC / "core/src/main/kotlin/com/hongguotv/core/L10nDict.kt"
 
 PAT = re.compile(r'"([^"\n]*[\u4e00-\u9fff][^"\n]*)"')
+# trFmt 整条模板含 {0} 占位符，普通 PAT 会切开；单独抓整条供繁中整串命中
+TFMT = re.compile(r'trFmt\(\s*"((?:[^"\\]|\\.)*)"')
 # 整页 HTML 模板用的是三引号原始字符串，上面的单行正则会把它切碎，这里单独整块取出来
 TRIPLE = re.compile(r'"""(.*?)"""', re.S)
 NOISE = ("//", "/*", "*/", "Log.", "http", "class ", "fun ", "return ", "import ", "package ")
@@ -108,7 +110,13 @@ def kt(s: str) -> str:
 
 EN = SRC / "core/src/main/kotlin/com/hongguotv/core/L10nEnglish.kt"
 PHRASES = SRC / "core/src/main/kotlin/com/hongguotv/core/L10nPhrases.kt"
-KT_KEY = re.compile(r'^\s*"((?:[^"\\]|\\.)*)"\s*(?:to|,)\s*$', re.M)
+# 既要匹配片段表的 `"key",`，也要匹配英文字典的 `"key" to "value",`。
+# 旧版只认前者，英文字典里人工维护的词条（如 "5 分钟"、许可说明逐行文案）永远进不了繁中字典。
+KT_KEY = re.compile(
+    r'^\s*"((?:[^"\\]|\\.)*)"\s*to\s+"(?:[^"\\]|\\.)*"\s*,?\s*$'
+    r'|^\s*"((?:[^"\\]|\\.)*)"\s*,\s*$',
+    re.M,
+)
 
 
 def runtime_keys():
@@ -122,7 +130,16 @@ def runtime_keys():
         if not path.exists():
             continue
         for m in KT_KEY.finditer(path.read_text(encoding="utf-8")):
-            out.add(_unescape(m.group(1)))
+            key = m.group(1) if m.group(1) is not None else m.group(2)
+            out.add(_unescape(key))
+    # trFmt 模板整条（含 {0}）也要有繁中：整串命中优先于片段替换，避免半中半英
+    for pattern in ("app/src/main/kotlin/**/*.kt", "core/src/main/kotlin/**/*.kt"):
+        for path in SRC.glob(pattern):
+            if "/test/" in str(path):
+                continue
+            for lit in TFMT.findall(path.read_text(encoding="utf-8")):
+                if any("一" <= c <= "鿿" for c in lit):
+                    out.add(_unescape(lit))
     return out
 
 

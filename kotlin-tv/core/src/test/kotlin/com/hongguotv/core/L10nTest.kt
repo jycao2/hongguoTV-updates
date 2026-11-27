@@ -2,6 +2,7 @@
 package com.hongguotv.core
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import java.util.Locale
 
@@ -100,6 +101,44 @@ class L10nTest {
     @Test fun `带插值模板回填 - 未命中回退后仍回填`() {
         L10n.configure(L10n.EN)
         assertEquals("一个测试 12", L10n.trFmt("一个测试 {0}", 12))
+    }
+
+    @Test fun `云端同步模板 - 整条命中不含中文残留`() {
+        // trFmt 模板含 {0}，字典整条收录后按整串命中，不再靠片段替换拼出半中半英
+        L10n.configure(L10n.EN)
+        assertEquals("Read 3 cloud favorites", L10n.trFmt("已读取 {0} 部云端收藏", 3))
+        assertEquals("Favorites synced: uploaded 5, failed 1", L10n.trFmt("收藏同步完成：上传 {0} 部，失败 {1} 部", 5, 1))
+        assertEquals("Signed in as +8613800138000", L10n.trFmt("已登录 {0}", "+8613800138000"))
+        assertFalse(L10n.trFmt("云端历史读取失败：{0}", "boom").contains("云端"))
+        L10n.configure(L10n.TW)
+        assertEquals("已讀取 3 部雲端收藏", L10n.trFmt("已读取 {0} 部云端收藏", 3))
+        assertEquals("雲端歷史讀取失敗：boom", L10n.trFmt("云端历史读取失败：{0}", "boom"))
+    }
+
+    @Test fun `屏保选项与许可弹窗 - 英文无中文残留`() {
+        // 2026-11-27 用户截图：屏保时长/间隔、素材卡与开源许可弹窗在英文界面仍是中文
+        L10n.configure(L10n.EN)
+        assertEquals("5 min", L10n.tr("5 分钟"))
+        assertEquals("10 sec", L10n.tr("10 秒"))
+        assertEquals("Upload from phone\nImages / GIFs / videos", L10n.tr("手机传自己的\n图片 / 动图 / 视频"))
+        assertEquals("Backdrop: My media", L10n.trFmt("屏保画面：{0}", L10n.tr("我的素材")))
+        val license = "本原生版以 GPL-3.0 发布。\n内容协议与加密处理移植自 drpys（22261ad）。\nAndroidX Media3 / OkHttp：Apache-2.0\nKotlin：Apache-2.0\nBouncy Castle：MIT\n完整源码和许可证见 GitHub：jycao2/hongguoTV。"
+        val en = L10n.tr(license)
+        assertFalse(en.contains("发布"))
+        assertFalse(en.contains("移植自"))
+        assertFalse(en.contains("完整源码"))
+        L10n.configure(L10n.TW)
+        assertEquals("5 分鐘", L10n.tr("5 分钟"))
+        assertFalse(L10n.tr(license).contains("发布"))
+    }
+
+    @Test fun `取址档案拉取中 - 英文有译且简繁同形回退原文`() {
+        // 设置行后缀在拉取期间常驻显示，英文界面不能是中文；简繁同形时回退原文即可
+        L10n.configure(L10n.EN)
+        assertEquals("Fetching…", L10n.tr("拉取中…"))
+        assertEquals("Checking profile…", L10n.tr("正在检查协议档案…"))
+        L10n.configure(L10n.TW)
+        assertEquals("拉取中…", L10n.tr("拉取中…"))
     }
 
     @Test fun `跟随系统 - 繁中地区`() {

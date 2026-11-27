@@ -279,6 +279,7 @@ class MainActivity: Activity() {
     private lateinit var extras: PlaybackExtras
     private lateinit var thirdStore: ThirdStore
     private lateinit var updater: AppUpdater
+    private lateinit var profileUpdater: PlaybackProfileUpdater
     private lateinit var mediaSession: TvMediaSession
     private val sleepTimer=SleepTimer { android.os.SystemClock.elapsedRealtime() }
     private var sleepStopped=false
@@ -497,6 +498,8 @@ class MainActivity: Activity() {
     private var railReorderPos=-1
     private var railReorderMove: ((Int)->Unit)?=null
     private var railReorderEnd: ((Boolean)->Unit)?=null
+    /** 抓起时刻：放下要过静默期，防真机 ROM 在长按触发后补发的 repeatCount==0 确认键立刻把它放下（2026-11-27） */
+    private var railReorderGrabAt=0L
     // 二级分段首项：导航 ↓ 先落到分段，再进内容
     private var segmentFirst: View?=null
     // 我的模块（最近观看/收藏）各分段按钮：切进我的时焦点先落当前页对应的分段，方便上下切区
@@ -812,6 +815,8 @@ class MainActivity: Activity() {
         backdropView=ImageView(this).apply { scaleType=ImageView.ScaleType.FIT_XY; importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO }
         loadBackdrop()
         updater=AppUpdater(this) { foreground && library.isLoaded && screen=="catalog" && !tvTools.showing }
+        // 取址协议档案：先把上次缓存的换上（几毫秒），再按 6 小时节流后台拉一次
+        profileUpdater=PlaybackProfileUpdater(this).apply { loadCached(); refreshIfDue() }
         connectivity=getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         // registerDefaultNetworkCallback 要 API 24，低版本退回全量回调
         runCatching {
@@ -2545,7 +2550,7 @@ class MainActivity: Activity() {
             // 揭幕后 openDetail 现场拉全量详情快 1-2 秒（用户 2026-11-18：首次进入偏慢）
             var revealed=false
             val revealOnce={ if(!revealed) { revealed=true; revealFreeFeed(startedAt) } }
-            work({ repository.detailLite(series.id) },{ d ->
+            work({ repository.detailFeed(series.id) },{ d ->
                 recommendDetails[series.id]=d
                 // 揭幕前把本部续播集的地址也备好（用户 2026-11-23：首次进入偏慢）：
                 // 过渡动画还剩几百毫秒，正好并行打这一发取址；起播时 playEpisode 命中
@@ -2709,7 +2714,7 @@ class MainActivity: Activity() {
             for((offset,target) in targets) {
                 val (seriesId,wantedEpisode)=target
                 // 详情已经缓存过也要继续往下走：地址/首块可能还没备，跳过就等于白预取
-                val detail=recommendDetails[seriesId] ?: runCatching { repository.detailLite(seriesId) }.getOrNull()
+                val detail=recommendDetails[seriesId] ?: runCatching { repository.detailFeed(seriesId) }.getOrNull()
                     ?.also { recommendDetails[seriesId]=it } ?: continue
                 val episode=detail.episodes.firstOrNull { it==wantedEpisode } ?: detail.episodes.firstOrNull() ?: continue
                 val now=android.os.SystemClock.elapsedRealtime()
@@ -2990,9 +2995,6 @@ class MainActivity: Activity() {
         // 取代弹窗选择器）；窄屏自动退回原来的左右两栏（选择走弹窗）。
         // 焦点语义：中栏行 →(右)→ 选项 →(左)→ 中栏行；开关行与动作行右栏只放占位图标，不可聚焦。
         val threePane=resources.configuration.screenWidthDp>=840
-        // 实验室功能 / 关于红果（6-7）全是弹窗动作与长文说明，右栏没内容价值：
-        // 这两个分类隐藏第三栏，退回两栏形态，右键不响应（用户 2026-11-26）
-        fun panelOn(index: Int) = threePane && index<6
         val optionPanel=SettingOptionPanel(this)
         /** 已注册可选项的设置行：labels/selectedIndex 绑定时现取（值可能刚被改过） */
         val rowOptions=linkedMapOf<SettingRow,RowOptions>()
@@ -3072,6 +3074,9 @@ class MainActivity: Activity() {
                     } else {
                         spec.onPick(i)
                         optionPanel.repaintOptions(spec.selectedIndex())
+                        // 执行型选项（刷新云端记录 / 同步本机到云端等）常会重建右栏，
+                        // 旧焦点视图已被移除，按执行前下标把焦点放回同一项（2026-11-27）
+                        optionPanel.focusOption(i)
                     }
                 }
                 view.toggleMode -> optionPanel.bindPlaceholder(view.title,view.desc,"在中间列表按确认键切换",view.checked)
@@ -3136,6 +3141,14 @@ class MainActivity: Activity() {
         var categories=categoryKeys.map { categoryDefs.getValue(it) }
         var activeKey=categoryKeys.first()
         var active=0
+        // 实验室功能 / 关于红果全是弹窗动作与长文说明，右栏没内容价值，这两个分类隐藏第三栏、
+        // 退回两栏形态（用户 2026-11-26）。必须按分类 key 判断、不能按位置 index<6：
+        // 左栏支持长按重排，一旦这两个分类被挪到前面，按位置的写法就会误显示右栏、
+        // 而挪到后面的分类反被误隐藏（用户 2026-11-27 实测）。
+        fun panelOn(index: Int): Boolean {
+            val key=categoryKeys.getOrNull(index) ?: return false
+            return threePane && key!="lab" && key!="about"
+        }
         val railButtons=categoryDefs.mapValues { (_,entry) ->
             button(entry.first,onClick={}).apply {
                 gravity=Gravity.CENTER_VERTICAL; textSize=15f; minHeight=dp(38); maxLines=1
@@ -3161,6 +3174,8 @@ class MainActivity: Activity() {
         var rechainSettings: ()->Unit = {}
         fun paintRail(index: Int,focused: Boolean) {
             val item=railButtons.getValue(categoryKeys[index])
+            // 抓起重排不改样式，仍是全系统唯一的焦点视觉（raised 底 + accent 描边）；
+            // 「抓起」只靠 scale 放大表达，比例上限受面板左右内边距限制（见 startRailReorder 注释）
             item.setTextColor(if(focused) white else if(index==active) accent else muted)
             item.background=rounded(if(focused) TvStyle.raised else if(index==active) TvStyle.selectedSurface else Color.TRANSPARENT,if(focused||index==active) accent else Color.TRANSPARENT)
             item.setTypeface(null,if(focused || index==active) Typeface.BOLD else Typeface.NORMAL)
@@ -3767,6 +3782,10 @@ class MainActivity: Activity() {
         lateinit var updates: SettingRow
         updates=setting(about,"版本与更新  ·  ${BuildConfig.VERSION_NAME}",{ updater.show(updates) },
             desc="查看当前版本号与更新日志，手动检查或直接安装新版本。")
+        lateinit var profileRow: SettingRow
+        profileRow=setting(about,"取址协议档案",{ showProfileSheet(profileRow) },
+            desc="播放取址用的签名常量与门地址，支持远程下发；出问题时一键恢复内置默认。")
+        profileRow.value=profileUpdater.statusLine()
         lateinit var checkButton: SettingRow
         checkButton=setting(about,"接口自检  ·  首页 / 搜索 / 播放",{ showInterfaceCheck(checkButton) },
             desc="逐项探测首页、搜索与播放接口是否可用，看剧异常时先跑一遍它。")
@@ -3794,9 +3813,11 @@ class MainActivity: Activity() {
             categoryKeys.forEachIndexed { index,key ->
                 val item=railButtons.getValue(key)
                 val up=railButtons.getValue(categoryKeys.getOrNull(index-1) ?: categoryKeys.first())
-                val down=railButtons.getValue(categoryKeys.getOrNull(index+1) ?: categoryKeys.last())
+                // 最后一个分类下面还有「常用」区块：此前 down 自指，遥控器永远到不了手机快传/备份（2026-11-27）
+                val downId=if(index==categoryKeys.lastIndex) commonButtons.firstOrNull()?.id ?: item.id
+                    else railButtons.getValue(categoryKeys[index+1]).id
                 item.nextFocusUpId=up.id
-                item.nextFocusDownId=down.id
+                item.nextFocusDownId=downId
                 item.nextFocusLeftId=item.id
                 item.nextFocusRightId=if(index==active) items.firstOrNull()?.id ?: item.id else item.id
             }
@@ -3840,10 +3861,17 @@ class MainActivity: Activity() {
         // ---- 左栏排序模式（用户 2026-11-25）：长按确认抓起 → 上下键移动（滑动动画）→ 确认/返回放下并保存 ----
         fun startRailReorder(pos: Int) {
             railReorderPos=pos
-            // 冻结上下焦点：排序期间方向键由 dispatchKeyEvent 接管
+            railReorderGrabAt=android.os.SystemClock.elapsedRealtime()
+            // 冻结上下焦点：排序期间方向键由 dispatchKeyEvent 接管。
+            // 注意这里的冻结会被下面的 rechainSettings() 重连覆盖，但排序期间方向键由
+            // dispatchKeyEvent 完全接管（9260-9263），不依赖焦点链，所以重连不影响移动。
             railButtons.values.forEach { b -> b.nextFocusUpId=b.id; b.nextFocusDownId=b.id }
-            railButtons.getValue(categoryKeys[pos]).animate().scaleX(1.08f).scaleY(1.08f).setDuration(140).start()
+            // 抓起放大 5%（原为 8%）：左栏按钮宽≈面板内宽（三栏 168dp / 两栏 216dp），面板左右
+            // 内边距只有 10dp，1.08 时每边外扩 6.7dp、缝只剩 3dp，accent 描边圆角看上去就顶出
+            // 面板边缘（用户 2026-11-27 电视拍照确认）；1.05 每边只扩 5.4dp，仍留约 5dp 余量。
+            railButtons.getValue(categoryKeys[pos]).animate().scaleX(1.05f).scaleY(1.05f).setDuration(140).start()
             Toast.makeText(this,L10n.tr("上下键移动 · 确认键放下"),Toast.LENGTH_SHORT).show()
+
         }
         railReorderMove={ delta ->
             val from=railReorderPos
@@ -3879,9 +3907,13 @@ class MainActivity: Activity() {
         }
         railReorderEnd={ save ->
             val from=railReorderPos
-            railReorderPos=-1; railReorderMove=null
+            // 注意不要清 railReorderMove：这个回调只在建页时赋值一次，清掉后第二次长按抓起
+            // 上下键就调用到 null ＝「长按后上下移动没反应」（2026-11-27 实测定性）。
+            // 回调内部已有 from>=0 守卫，退出排序后不会误触发。
+            railReorderPos=-1
             if(from>=0) {
                 val pos=from.coerceIn(0,categoryKeys.lastIndex)
+                // 放下缩回原尺寸，否则这一项会一直比别的分类大一圈（2026-11-27）
                 railButtons.getValue(categoryKeys[pos]).animate().scaleX(1f).scaleY(1f).setDuration(140).start()
                 if(save) {
                     // 顺序落盘并进备份文件：换设备扫码/本地恢复后分类顺序跟着走
@@ -3890,8 +3922,13 @@ class MainActivity: Activity() {
                 }
                 rechainSettings()
                 categoryKeys.forEachIndexed { i,key -> paintRail(i,railButtons.getValue(key).hasFocus()) }
-                // 放下后焦点稳稳落回该分类（中途 detach 可能已把焦点丢给顶栏）
-                railScroll.post { railButtons.getValue(categoryKeys[pos]).requestFocus() }
+                // 放下后焦点稳稳落回该分类（中途 detach 可能已把焦点丢给顶栏）。
+                // 焦点链在这里再重连一次：抓起时冻结的 up/down=self 要等布局稳定后重连才可靠，
+                // 否则放下后偶尔出现上下键不移动（2026-11-27 实测）。
+                railScroll.post {
+                    rechainSettings()
+                    railButtons.getValue(categoryKeys[pos]).requestFocus()
+                }
             }
         }
         railButtons.forEach { (key,item) ->
@@ -4491,7 +4528,7 @@ class MainActivity: Activity() {
         }
         android.util.Log.i("HongguoTV","Detail open preloaded=${preloaded!=null} keepPlayer=$keepPlayer resume=$resume")
         if(preloaded!=null) apply(preloaded)
-        else work({ if(recommendMode) repository.detailLite(series.id) else repository.detail(series.id) }, apply, { problem ->
+        else work({ if(recommendMode) repository.detailFeed(series.id) else repository.detail(series.id) }, apply, { problem ->
             // 详情都没取到：过渡层留着只会一直转圈盖住错误页
             releaseFreeze()
             val host=body ?: base(series.title)
@@ -6168,6 +6205,48 @@ class MainActivity: Activity() {
         tvTools.info("观看统计 · 本机",body,anchor)
     }
 
+    /** 取址协议档案：看当前生效的那份、手动拉一次、或者一键回到内置默认。
+     *  站方改字段集时改远端档案即可生效；这里给的是「出问题时能立刻退回」的把手。 */
+    private fun showProfileSheet(row: SettingRow) {
+        fun refreshRow() { row.value = L10n.tr(profileUpdater.statusLine()) }
+        // 弹窗是独立窗口，关闭后 Android 不会自动把焦点还给触发它的设置行；
+        // 与项目里其它设置弹窗一致，用 OnDismissListener 回焦。post 延后一帧，
+        // 避免和二级窗（详情/确认）开窗时的焦点抢占（2026-11-27）。
+        // 注意只给「终点窗」挂：主选择窗后面还会开详情/确认窗，给它挂会在二级窗
+        // 刚打开时把焦点抢回设置行。检查更新没有二级窗，单独在回调里回焦。
+        fun refocus() { row.post { if(row.isAttachedToWindow) row.requestFocus() } }
+        TvDialog.choose(this, L10n.tr("取址协议档案"),
+            listOf(L10n.tr("查看当前档案"), L10n.tr("立即检查更新"), L10n.tr("恢复内置默认")),
+            { index ->
+                when (index) {
+                    0 -> {
+                        val error = profileUpdater.sanityError()
+                        val body = profileUpdater.summary() + if (error == null) "" else "\n\n自检异常：$error"
+                        TvDialog.info(this, L10n.tr("取址协议档案"), body)
+                            .also { it.setOnDismissListener { refocus() } }.show()
+                    }
+                    1 -> {
+                        refocus() // 检查更新没有二级窗：开窗即回焦，不能等网络回调（最长 12s 焦点悬空）
+                        // 行内常驻显示拉取中：Toast 一闪而过，用户看不出正在检查；
+                        // 回调里 refreshRow() 会把它换回最终状态（2026-11-27）。
+                        row.value = L10n.tr(profileUpdater.statusLine()) + " · " + L10n.tr("拉取中…")
+                        Toast.makeText(this, L10n.tr("正在检查协议档案…"), Toast.LENGTH_SHORT).show()
+                        profileUpdater.refresh { _, message ->
+                            refreshRow()
+                            Toast.makeText(this, L10n.tr(message), Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    else -> TvDialog.confirm(this, L10n.tr("恢复内置默认"),
+                        L10n.tr("清掉已下发的协议档案，播放取址回到随包默认值。下次启动会重新检查远端档案。"),
+                        confirmText = L10n.tr("恢复"), danger = true) {
+                        profileUpdater.resetToBuiltin()
+                        refreshRow()
+                        Toast.makeText(this, L10n.tr("已恢复内置默认档案"), Toast.LENGTH_SHORT).show()
+                    }.also { it.setOnDismissListener { refocus() } }.show()
+                }
+            }, extra = L10n.tr("当前：") + L10n.tr(profileUpdater.statusLine())).show()
+    }
+
     /** 接口自检：用户逐项点击，单次串行请求，失败只提示不重试，避免给站点增加并发压力。
      *  状态圆点内嵌在按钮文字前：灰=未检测，橙=检测中，绿=通，红=不通；3 秒内重复点击直接忽略。 */
     private fun showInterfaceCheck(anchor: View) {
@@ -6202,9 +6281,9 @@ class MainActivity: Activity() {
         }
         fun check(name: String,btn: TextView,probe: ()->String) {
             val now=System.currentTimeMillis()
-            if(name in busy || now-(lastAt[name] ?: 0L)<3_000) { status.text="${L10n.tr(name)} 请稍候再试"; return }
+            if(name in busy || now-(lastAt[name] ?: 0L)<3_000) { status.text="${L10n.tr(name)} · ${L10n.tr("请稍候再试")}"; return }
             lastAt[name]=now
-            busy+=name; status.text="正在检测 ${L10n.tr(name)}…"
+            busy+=name; status.text="${L10n.tr("正在检测 ")}${L10n.tr(name)}…"
             btn.text=dotLabel(name,accent)
             val started=android.os.SystemClock.elapsedRealtime()
             io.execute {
@@ -6214,7 +6293,7 @@ class MainActivity: Activity() {
                     val elapsed=android.os.SystemClock.elapsedRealtime()-started
                     result.fold(
                         { detail -> status.text="${L10n.tr(name)} · 正常 · $detail · ${elapsed}ms"; btn.text=dotLabel(name,dotOk) },
-                        { problem -> status.text="${L10n.tr(name)} · 失败 · ${(problem.message ?: problem.javaClass.simpleName).take(80)}"; btn.text=dotLabel(name,dotFail) })
+                        { problem -> status.text="${L10n.tr(name)} · ${L10n.tr("失败")} · ${L10n.tr((problem.message ?: problem.javaClass.simpleName).take(80))}"; btn.text=dotLabel(name,dotFail) })
                     busy-=name
                 }
             }
@@ -7476,10 +7555,10 @@ class MainActivity: Activity() {
                 val all=saverMediaFiles()
                 val picked=saverPickedNames(all)
                 val note=when {
-                    all.isEmpty() -> "手机传自己的\n图片 / 动图 / 视频"
-                    picked.isEmpty() -> "我的素材\n共 ${all.size} 个 · 全部轮播"
-                    picked.size==1 -> "我的素材\n只播 ${shortName(picked[0],12)}"
-                    else -> "我的素材\n轮播 ${picked.size}/${all.size} 个"
+                    all.isEmpty() -> L10n.tr("手机传自己的\n图片 / 动图 / 视频")
+                    picked.isEmpty() -> L10n.trFmt("我的素材\n共 {0} 个 · 全部轮播",all.size)
+                    picked.size==1 -> L10n.trFmt("我的素材\n只播 {0}",shortName(picked[0],12))
+                    else -> L10n.trFmt("我的素材\n轮播 {0}/{1} 个",picked.size,all.size)
                 }
                 frame.addView(text(note,12f,muted).apply {
                     gravity=Gravity.CENTER; maxLines=3; ellipsize=TextUtils.TruncateAt.END
@@ -7522,7 +7601,7 @@ class MainActivity: Activity() {
                     library.screensaverStyle=key
                     refreshSaverStyleSetting?.invoke()
                     (it.tag as? AlertDialog)?.dismiss()
-                    Toast.makeText(this@MainActivity, L10n.tr("屏保画面：$name"),Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, L10n.trFmt("屏保画面：{0}",L10n.tr(name)),Toast.LENGTH_SHORT).show()
                     // 选了「我的素材」却一个素材都没有：直接把上传入口摆出来，别让用户对着提示干瞪眼
                     if(key=="custom" && saverMediaFiles().isEmpty() && quickTransferMedia().isEmpty()) {
                         main.postDelayed({ if(!isDestroyed) showSaverMediaManager(anchor) },450)
@@ -9209,8 +9288,12 @@ class MainActivity: Activity() {
                 KeyEvent.KEYCODE_DPAD_LEFT,KeyEvent.KEYCODE_DPAD_RIGHT -> return true
                 KeyEvent.KEYCODE_DPAD_CENTER,KeyEvent.KEYCODE_ENTER -> {
                     // 抓起本身就是长按：松手前系统还在灌 repeat 键，必须只有全新一按（repeat==0）
-                    // 才算放下，否则抓起 50ms 后就被残留重复键自动放下＝功能无效（用户 2026-11-25）
-                    if(event.repeatCount==0) railReorderEnd?.invoke(true)
+                    // 才算放下，否则抓起 50ms 后就被残留重复键自动放下＝功能无效（用户 2026-11-25）。
+                    // 还要过 500ms 静默期：部分真机 ROM 在长按触发后补发一个 repeatCount==0 的
+                    // 确认键 DOWN，单靠 repeatCount 判断挡不住，照样会抓起瞬间被放下、上下键失去
+                    // 排序接管＝表现成「长按后上下没反应」（用户 2026-11-27）。
+                    if(event.repeatCount==0 &&
+                        android.os.SystemClock.elapsedRealtime()-railReorderGrabAt>=500) railReorderEnd?.invoke(true)
                     return true
                 }
                 KeyEvent.KEYCODE_BACK -> { railReorderEnd?.invoke(true); return true }
@@ -9379,7 +9462,7 @@ class MainActivity: Activity() {
     override fun onDestroy() {
         generation++; cancelWork()
         if(networkRegistered) connectivity.unregisterNetworkCallback(networkCallback)
-        favoriteMonitor.destroy(); tvTools.destroy(); updater.destroy(); saveProgress(); releasePlayer(); accountManager.destroy(); library.close()
+        favoriteMonitor.destroy(); tvTools.destroy(); updater.destroy(); profileUpdater.destroy(); saveProgress(); releasePlayer(); accountManager.destroy(); library.close()
         closeRemote()
         xiaoAi?.destroy()
         third?.release()

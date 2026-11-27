@@ -652,7 +652,7 @@ class AccountManager(private val context: Context, private val library: Library)
      * 走官方 App 的 passport 短信通道（网页发码被滑块挡死）；滑块要求出现时引导回扫码。
      */
     private fun phoneLogin(activity: android.app.Activity) {
-        phoneField(activity, "手机号登录", "填完点「发送验证码」\n大陆直接填 11 位；境外用 +区号 号码（如 +886 0912345678）", null, numeric = false) { raw ->
+        phoneNumberField(activity) { raw ->
             val login = PhoneLogin(http)
             task(
                 { login.send(raw) },
@@ -660,6 +660,93 @@ class AccountManager(private val context: Context, private val library: Library)
                 { failure -> phoneFailed(activity, failure) },
             )
         }
+    }
+
+    /**
+     * 手机号输入（区号 + 号码分栏）。左侧点「区号」弹地区选择窗（官方 14 个地区，默认中国大陆），
+     * 右侧填号码。提交时拼成 `+区号 号码` 交给 [PhoneLogin.send]；大陆号拼出来是纯 11 位，走原签名路径。
+     */
+    private fun phoneNumberField(activity: android.app.Activity, submit: (String) -> Unit) {
+        val dp = { v: Int -> (v * activity.resources.displayMetrics.density).toInt() }
+        val countries = IntlPhone.COUNTRIES
+        var index = 0
+        val codeButton = TvDialog.capsuleButton(activity, "") {}
+        fun renderCode() {
+            val c = countries[index]
+            codeButton.text = L10n.trFmt("{0} {1}", c.code, L10n.tr(c.name))
+        }
+        renderCode()
+        val numberField =
+            android.widget.EditText(activity).apply {
+                isSingleLine = true
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                hint = L10n.tr("手机号")
+                textSize = 16f
+                setTextColor(TvStyle.text)
+                setHintTextColor(TvStyle.muted)
+                // 号码框会吞掉 LEFT；光标已在最左侧时把焦点交回区号按钮，遥控器不用先清空号码。
+                setOnKeyListener { v, keyCode, event ->
+                    if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT &&
+                        event.action == android.view.KeyEvent.ACTION_DOWN &&
+                        v is android.widget.EditText &&
+                        v.selectionStart == 0 && v.selectionEnd == 0
+                    ) {
+                        codeButton.requestFocus()
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        // 点左侧区号按钮 → 弹地区选择窗；选中后更新按钮文案并回到号码框。
+        codeButton.setOnClickListener {
+            val labels =
+                countries.mapIndexed { i, c ->
+                    val name = L10n.tr(c.name)
+                    L10n.trFmt("{0} {1}", c.code, name) + if (i == index) "   ·   " + L10n.tr("当前") else ""
+                }
+            TvDialog.choose(
+                activity,
+                L10n.tr("选择区号"),
+                labels,
+                onChoice = { which -> index = which; renderCode(); numberField.requestFocus() },
+                focusIndex = index,
+                anchorView = codeButton,
+            ).show()
+        }
+        val row = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            addView(codeButton, android.widget.LinearLayout.LayoutParams(-2, -2))
+            addView(numberField, android.widget.LinearLayout.LayoutParams(-1, -2).apply { leftMargin = dp(10) })
+        }
+        val content = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            addView(TvDialog.title(activity, L10n.tr("手机号登录")))
+            addView(TvDialog.body(activity, L10n.tr("选区号并填号码，再点「发送验证码」")))
+            addView(row, android.widget.LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        }
+        val buttons = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.END
+            setPadding(0, dp(14), 0, 0)
+        }
+        val dialog = android.app.AlertDialog.Builder(activity).setView(TvDialog.card(activity, content)).create()
+        val cancel = TvDialog.capsuleButton(activity, L10n.tr("返回")) { dialog.dismiss(); showLoginDialog(activity) }
+        buttons.addView(cancel, android.widget.LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(12) })
+        val go = TvDialog.capsuleButton(activity, L10n.tr("发送验证码")) {}
+        buttons.addView(go)
+        content.addView(buttons)
+        TvDialog.styleWindow(activity, dialog) { numberField.requestFocus() }
+        go.setOnClickListener {
+            val digits = numberField.text.toString().trim()
+            if (digits.isEmpty()) return@setOnClickListener
+            val c = countries[index]
+            val raw = if (c.code == "+86") digits else "${c.code} $digits"
+            dialog.dismiss()
+            submit(raw)
+        }
+        dialog.show()
     }
 
     private fun phoneCode(activity: android.app.Activity, login: PhoneLogin, masked: String, error: String? = null) {
